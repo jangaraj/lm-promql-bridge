@@ -106,3 +106,77 @@ func TestQueryRangeRejectsExcessiveChunkCount(t *testing.T) {
 		t.Fatalf("request count = %d, want 0 for rejected range", roundTripper.requestCount)
 	}
 }
+
+func TestRateLimitRetryDelay(t *testing.T) {
+	tests := []struct {
+		name      string
+		status    int
+		remaining string
+		window    string
+		wantRetry bool
+		wantDelay time.Duration
+	}{
+		{
+			name:      "window ends within two seconds",
+			status:    http.StatusTooManyRequests,
+			remaining: "0",
+			window:    "1",
+			wantRetry: true,
+			wantDelay: time.Second,
+		},
+		{
+			name:      "window exceeds two seconds",
+			status:    http.StatusTooManyRequests,
+			remaining: "0",
+			window:    "3",
+		},
+		{
+			name:   "missing remaining header",
+			status: http.StatusTooManyRequests,
+			window: "1",
+		},
+		{
+			name:      "remaining quota is nonzero",
+			status:    http.StatusTooManyRequests,
+			remaining: "1",
+			window:    "1",
+		},
+		{
+			name:      "missing window header",
+			status:    http.StatusTooManyRequests,
+			remaining: "0",
+		},
+		{
+			name:      "invalid window header",
+			status:    http.StatusTooManyRequests,
+			remaining: "0",
+			window:    "invalid",
+		},
+		{
+			name:      "not a rate-limit response",
+			status:    http.StatusServiceUnavailable,
+			remaining: "0",
+			window:    "1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := &http.Response{
+				StatusCode: tt.status,
+				Header: http.Header{
+					"X-Rate-Limit-Remaining": []string{tt.remaining},
+					"X-Rate-Limit-Window":    []string{tt.window},
+				},
+			}
+
+			delay, retry := rateLimitRetryDelay(resp)
+			if retry != tt.wantRetry {
+				t.Fatalf("retry = %t, want %t", retry, tt.wantRetry)
+			}
+			if delay != tt.wantDelay {
+				t.Fatalf("delay = %s, want %s", delay, tt.wantDelay)
+			}
+		})
+	}
+}

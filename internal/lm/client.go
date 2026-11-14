@@ -155,7 +155,37 @@ func (c *Client) doRequestWithContext(ctx context.Context, path string, payload 
 		}
 
 		resp, err = c.httpClient.Do(req)
-		if err == nil && resp.StatusCode < 500 && resp.StatusCode != 429 {
+
+		if err == nil && resp.StatusCode == http.StatusTooManyRequests {
+			delay, shouldRetry := rateLimitRetryDelay(resp)
+			_ = resp.Body.Close()
+
+			if !shouldRetry {
+				return nil, fmt.Errorf(
+					"LogicMonitor returned 429; rate-limit headers do not indicate availability within %s",
+					maxRateLimitWait,
+				)
+			}
+			if attempt == maxRetries {
+				return nil, fmt.Errorf(
+					"LogicMonitor returned 429 after %d attempts",
+					maxRetries,
+				)
+			}
+
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
+			continue
+		}
+
+		if err == nil && resp.StatusCode < 500 {
 			break
 		}
 		if resp != nil {
@@ -167,10 +197,15 @@ func (c *Client) doRequestWithContext(ctx context.Context, path string, payload 
 			}
 			return nil, fmt.Errorf("logicmonitor API returned status %d after %d attempts", resp.StatusCode, maxRetries)
 		}
+
+		timer := time.NewTimer(backoff)
 		select {
 		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
 			return nil, ctx.Err()
-		case <-time.After(backoff):
+		case <-timer.C:
 		}
 		backoff *= 2
 	}
@@ -447,4 +482,31 @@ func (c *Client) MetricNames(ctx context.Context, req *MetricNamesRequest) ([]by
 	}
 
 	return c.doRequestWithContext(ctx, "/metrics/metric-names", req)
+}
+
+const maxRateLimitWait = 2 * time.Second
+
+// rateLimitRetryDelay returns a delay only when LogicMonitor's headers indicate
+// that the rate-limit window will elapse within maxRateLimitWait.
+func rateLimitRetryDelay(resp *http.Response) (time.Duration, bool) {
+	if resp == nil || resp.StatusCode != http.StatusTooManyRequests {
+		return 0, false
+	}
+
+	remaining, err := strconv.Atoi(strings.TrimSpace(resp.Header.Get("X-Rate-Limit-Remaining")))
+	if err != nil || remaining != 0 {
+		return 0, false
+	}
+
+	windowSeconds, err := strconv.ParseFloat(strings.TrimSpace(resp.Header.Get("X-Rate-Limit-Window")), 64)
+	if err != nil || math.IsNaN(windowSeconds) || math.IsInf(windowSeconds, 0) || windowSeconds <= 0 {
+		return 0, false
+	}
+
+	delay := time.Duration(windowSeconds * float64(time.Second))
+	if delay <= 0 || delay > maxRateLimitWait {
+		return 0, false
+	}
+
+	return delay, true
 }
