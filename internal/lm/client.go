@@ -274,16 +274,34 @@ func (c *Client) QueryRange(ctx context.Context, req *QueryRequest) ([]byte, err
 
 				respBytes, err := c.doRequestWithContext(gCtx, "/metrics/query-range", subReq)
 				if err != nil {
-					return err
+					return fmt.Errorf("query-range chunk %d: %w", i+1, err)
 				}
 
 				var lmResp lmAPIResponse
-				if err := json.Unmarshal(respBytes, &lmResp); err == nil && len(lmResp.Data) > 0 {
-					var chunkMetrics []lmMetricResult
-					if err := json.Unmarshal(lmResp.Data, &chunkMetrics); err == nil {
-						results[i] = chunkMetrics
-					}
+				if err := json.Unmarshal(respBytes, &lmResp); err != nil {
+					return fmt.Errorf("decode LogicMonitor query-range response for chunk %d: %w", i+1, err)
 				}
+
+				data := bytes.TrimSpace(lmResp.Data)
+				if len(data) == 0 || bytes.Equal(data, []byte("null")) {
+					// LogicMonitor may return no data for a chunk in a long range query.
+					// Treat that chunk as empty and merge results from the remaining chunks.
+					results[i] = []lmMetricResult{}
+					continue
+				}
+				if data[0] != '[' {
+					return fmt.Errorf("LogicMonitor query-range response for chunk %d has invalid data: expected an array", i+1)
+				}
+
+				var chunkMetrics []lmMetricResult
+				if err := json.Unmarshal(data, &chunkMetrics); err != nil {
+					return fmt.Errorf("decode LogicMonitor query-range data for chunk %d: %w", i+1, err)
+				}
+				if chunkMetrics == nil {
+					return fmt.Errorf("LogicMonitor query-range response for chunk %d has null data; expected an array", i+1)
+				}
+
+				results[i] = chunkMetrics
 			}
 			return nil
 		})

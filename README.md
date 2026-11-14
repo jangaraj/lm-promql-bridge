@@ -45,7 +45,7 @@ Configure the bridge using environment variables or a `.env` file:
 | `LM_ACCESS_ID` | LogicMonitor API Access ID (for LMv1 HMAC auth) | *Conditional* | — |
 | `LM_ACCESS_KEY` | LogicMonitor API Access Key (for LMv1 HMAC auth) | *Conditional* | — |
 | `LM_BEARER_TOKEN` | LogicMonitor API Bearer Token (alternative to LMv1 credentials) | *Conditional* | — |
-| `SERVER_PORT` | Bridge HTTP endpoint port | No | `80` |
+| `SERVER_PORT` | Bridge HTTP endpoint port | No | `8080` |
 | `SERVER_USERNAME` | Optional username for securing bridge HTTP endpoints | No | `""` (Disabled) |
 | `SERVER_PASSWORD` | Optional password for securing bridge HTTP endpoints | No | `""` (Disabled) |
 | `DEBUG` | Enable verbose debug logging (`true`/`false`) | No | `false` |
