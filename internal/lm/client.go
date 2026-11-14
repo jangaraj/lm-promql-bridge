@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"sort"
@@ -20,6 +21,11 @@ import (
 	"lm-promql-bridge/internal/config"
 
 	"golang.org/x/sync/errgroup"
+)
+
+const (
+	maxQueryRangeChunks = 100
+	queryRangeWorkers   = 10
 )
 
 type Client struct {
@@ -114,37 +120,39 @@ func (c *Client) doRequestWithContext(ctx context.Context, path string, payload 
 		)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(bodyBytes))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create http request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("X-Version", "3")
-
-	epoch := strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond), 10)
-
-	if c.cfg.BearerToken != "" {
-		req.Header.Set("Authorization", "Bearer "+c.cfg.BearerToken)
-	} else {
-		verb := "POST"
-		requestParams := string(bodyBytes)
-		signatureVars := verb + epoch + requestParams + path
-
-		h := hmac.New(sha256.New, []byte(c.cfg.AccessKey))
-		h.Write([]byte(signatureVars))
-		signature := base64.StdEncoding.EncodeToString(h.Sum(nil))
-
-		authHeader := fmt.Sprintf("LMv1 %s:%s:%s", c.cfg.AccessID, signature, epoch)
-		req.Header.Set("Authorization", authHeader)
-	}
-
 	var resp *http.Response
 	maxRetries := 3
 	backoff := 500 * time.Millisecond
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Recreate the request on every attempt because the HTTP client consumes
+		// the request body when sending it.
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create http request: %w", err)
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("X-Version", "3")
+
+		epoch := strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond), 10)
+
+		if c.cfg.BearerToken != "" {
+			req.Header.Set("Authorization", "Bearer "+c.cfg.BearerToken)
+		} else {
+			verb := "POST"
+			requestParams := string(bodyBytes)
+			signatureVars := verb + epoch + requestParams + path
+
+			h := hmac.New(sha256.New, []byte(c.cfg.AccessKey))
+			h.Write([]byte(signatureVars))
+			signature := base64.StdEncoding.EncodeToString(h.Sum(nil))
+
+			authHeader := fmt.Sprintf("LMv1 %s:%s:%s", c.cfg.AccessID, signature, epoch)
+			req.Header.Set("Authorization", authHeader)
+		}
+
 		resp, err = c.httpClient.Do(req)
 		if err == nil && resp.StatusCode < 500 && resp.StatusCode != 429 {
 			break
@@ -206,57 +214,95 @@ func (c *Client) QueryRange(ctx context.Context, req *QueryRequest) ([]byte, err
 		return c.doRequestWithContext(ctx, "/metrics/query-range", req)
 	}
 
+	if math.IsNaN(startVal) || math.IsInf(startVal, 0) ||
+		math.IsNaN(endVal) || math.IsInf(endVal, 0) {
+		return nil, fmt.Errorf("query range start and end must be finite values")
+	}
+	if endVal < startVal {
+		return nil, fmt.Errorf("query range end must not be before start")
+	}
+
 	maxChunkDuration := float64(25 * 24 * 3600)
-	if (endVal - startVal) <= maxChunkDuration {
-		return c.doRequestWithContext(ctx, "/metrics/query-range", req)
+	duration := endVal - startVal
+	maxRangeDuration := maxChunkDuration * maxQueryRangeChunks
+	if duration > maxRangeDuration {
+		return nil, fmt.Errorf("query range exceeds maximum of %d chunks", maxQueryRangeChunks)
 	}
 
-	if c.cfg.Debug {
-		slog.Info("Parallelizing chunked QueryRange execution", "totalDurationDays", (endVal-startVal)/86400)
+	chunkCount := int(math.Ceil(duration / maxChunkDuration))
+	if chunkCount == 0 {
+		// A zero-length range still requires one upstream query.
+		chunkCount = 1
 	}
 
-	var chunks []struct {
-		start, end float64
+	if c.cfg.Debug && duration > maxChunkDuration {
+		slog.Info("Parallelizing chunked QueryRange execution", "totalDurationDays", duration/86400)
 	}
+
+	type queryChunk struct {
+		start float64
+		end   float64
+	}
+
+	chunks := make([]queryChunk, 0, chunkCount)
 	currentStart := startVal
-	for currentStart < endVal {
+	for i := 0; i < chunkCount; i++ {
 		currentEnd := currentStart + maxChunkDuration
 		if currentEnd > endVal {
 			currentEnd = endVal
 		}
-		chunks = append(chunks, struct{ start, end float64 }{currentStart, currentEnd})
+		chunks = append(chunks, queryChunk{start: currentStart, end: currentEnd})
 		currentStart = currentEnd
 	}
 
 	results := make([][]lmMetricResult, len(chunks))
+	jobs := make(chan int)
 	g, gCtx := errgroup.WithContext(ctx)
 
-	for i, chunk := range chunks {
-		i, chunk := i, chunk
+	workerCount := min(queryRangeWorkers, len(chunks))
+	for range workerCount {
 		g.Go(func() error {
-			subReq := &QueryRequest{
-				Query: req.Query,
-				Time:  req.Time,
-				Start: strconv.FormatFloat(chunk.start, 'f', -1, 64),
-				End:   strconv.FormatFloat(chunk.end, 'f', -1, 64),
-				Step:  req.Step,
-			}
-			respBytes, err := c.doRequestWithContext(gCtx, "/metrics/query-range", subReq)
-			if err != nil {
-				return err
-			}
-			var lmResp lmAPIResponse
-			if err := json.Unmarshal(respBytes, &lmResp); err == nil && len(lmResp.Data) > 0 {
-				var chunkMetrics []lmMetricResult
-				if err := json.Unmarshal(lmResp.Data, &chunkMetrics); err == nil {
-					results[i] = chunkMetrics
+			for i := range jobs {
+				chunk := chunks[i]
+				subReq := &QueryRequest{
+					Query: req.Query,
+					Time:  req.Time,
+					Start: strconv.FormatFloat(chunk.start, 'f', -1, 64),
+					End:   strconv.FormatFloat(chunk.end, 'f', -1, 64),
+					Step:  req.Step,
+				}
+
+				respBytes, err := c.doRequestWithContext(gCtx, "/metrics/query-range", subReq)
+				if err != nil {
+					return err
+				}
+
+				var lmResp lmAPIResponse
+				if err := json.Unmarshal(respBytes, &lmResp); err == nil && len(lmResp.Data) > 0 {
+					var chunkMetrics []lmMetricResult
+					if err := json.Unmarshal(lmResp.Data, &chunkMetrics); err == nil {
+						results[i] = chunkMetrics
+					}
 				}
 			}
 			return nil
 		})
 	}
 
+dispatch:
+	for i := range chunks {
+		select {
+		case jobs <- i:
+		case <-gCtx.Done():
+			break dispatch
+		}
+	}
+	close(jobs)
+
 	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 

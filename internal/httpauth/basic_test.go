@@ -59,6 +59,46 @@ func TestBasicAuth_AllowsCorrectCredentials(t *testing.T) {
 	}
 }
 
+func TestBasicAuth_AllowsHealthzWithoutCredentials(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+
+	var reached bool
+
+	handler := BasicAuth("user", "pass", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if !reached {
+		t.Fatal("expected downstream handler to be called")
+	}
+}
+
+func TestBasicAuth_RequiresCredentialsForHealthzSubpaths(t *testing.T) {
+	for _, path := range []string{"/healthz/", "/healthz-extra"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			rec := httptest.NewRecorder()
+
+			handler := BasicAuth("user", "pass", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401, got %d", rec.Code)
+			}
+		})
+	}
+}
+
 func TestBasicAuth_SetsWWWAuthenticateHeaderOnFailure(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/query", nil)
 	rec := httptest.NewRecorder()
