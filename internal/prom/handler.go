@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
@@ -483,6 +484,30 @@ type MetricMetadata struct {
 	Type string `json:"type"`
 	Help string `json:"help"`
 	Unit string `json:"unit"`
+}
+
+func parseInstantQueryRequest(r *http.Request) (query, timeStr string) {
+	if r.Method != http.MethodPost {
+		return r.URL.Query().Get("query"), r.URL.Query().Get("time")
+	}
+
+	mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if mediaType == "application/json" {
+		var body struct {
+			Query string `json:"query"`
+			Time  string `json:"time"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+			return body.Query, body.Time
+		}
+		return "", ""
+	}
+
+	if err := r.ParseForm(); err == nil {
+		return r.FormValue("query"), r.FormValue("time")
+	}
+
+	return "", ""
 }
 
 func (h *Handler) HandleMetadata(w http.ResponseWriter, r *http.Request) {
