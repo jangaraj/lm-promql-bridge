@@ -53,10 +53,8 @@ func TestParseInstantQueryRequest(t *testing.T) {
 
 			gotQuery, gotTime := parseInstantQueryRequest(req)
 			if gotQuery != tt.wantQuery || gotTime != tt.wantTime {
-				t.Fatalf(
-					"parseInstantQueryRequest() = (%q, %q), want (%q, %q)",
-					gotQuery, gotTime, tt.wantQuery, tt.wantTime,
-				)
+				t.Fatalf("parseInstantQueryRequest() = (%q, %q), want (%q, %q)",
+					gotQuery, gotTime, tt.wantQuery, tt.wantTime)
 			}
 		})
 	}

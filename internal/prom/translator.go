@@ -56,7 +56,7 @@ func TranslateLMResponse(rawLMBody []byte, defaultResultType string, debug bool,
 	var parsedData interface{}
 	_ = json.Unmarshal(lmResp.Data, &parsedData)
 
-	var promResult interface{} = parsedData
+	promResult := parsedData
 
 	switch resultType {
 	case "scalar":

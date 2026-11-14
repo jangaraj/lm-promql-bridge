@@ -231,23 +231,7 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { <-h.concurrency }()
 
-	var query, timeStr string
-
-	if r.Method == http.MethodPost {
-		if err := r.ParseForm(); err == nil {
-			query = r.FormValue("query")
-			timeStr = r.FormValue("time")
-		} else {
-			var bodyMap map[string]string
-			if err := json.NewDecoder(r.Body).Decode(&bodyMap); err == nil {
-				query = bodyMap["query"]
-				timeStr = bodyMap["time"]
-			}
-		}
-	} else {
-		query = r.URL.Query().Get("query")
-		timeStr = r.URL.Query().Get("time")
-	}
+	query, timeStr := parseInstantQueryRequest(r)
 
 	if query == "" {
 		writeError(w, "bad_data", "the query parameter is missing", http.StatusBadRequest)
