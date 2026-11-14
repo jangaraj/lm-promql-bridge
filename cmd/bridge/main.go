@@ -50,9 +50,9 @@ func main() {
 		_, _ = w.Write([]byte("OK"))
 	})
 
-	handler := http.Handler(mux)
+	handler := prom.LimitRequestBody(http.Handler(mux))
 	if cfg.BasicAuthEnabled() {
-		handler = httpauth.BasicAuth(cfg.ServerUsername, cfg.ServerPassword, mux)
+		handler = httpauth.BasicAuth(cfg.ServerUsername, cfg.ServerPassword, handler)
 	}
 
 	server := &http.Server{

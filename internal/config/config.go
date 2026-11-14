@@ -44,9 +44,9 @@ func Load() (*Config, error) {
 		portal = portal + ".logicmonitor.com"
 	}
 
-	accessID := os.Getenv("LM_ACCESS_ID")
-	accessKey := os.Getenv("LM_ACCESS_KEY")
-	bearerToken := os.Getenv("LM_BEARER_TOKEN")
+	accessID := strings.TrimSpace(os.Getenv("LM_ACCESS_ID"))
+	accessKey := strings.TrimSpace(os.Getenv("LM_ACCESS_KEY"))
+	bearerToken := strings.TrimSpace(os.Getenv("LM_BEARER_TOKEN"))
 
 	if bearerToken == "" && (accessID == "" || accessKey == "") {
 		return nil, fmt.Errorf("either LM_BEARER_TOKEN or both LM_ACCESS_ID and LM_ACCESS_KEY must be provided")
@@ -68,21 +68,30 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	serverTLSCert := strings.TrimSpace(os.Getenv("SERVER_TLS_CERT"))
 	serverTLSKey := strings.TrimSpace(os.Getenv("SERVER_TLS_KEY"))
+
 	if tlsEnabled && ((serverTLSCert == "") != (serverTLSKey == "")) {
-		return nil, fmt.Errorf("SERVER_TLS_CERT and SERVER_TLS_KEY must be set together; omit both to generate a self-signed certificate")
+		return nil, fmt.Errorf("SERVER_TLS_CERT and SERVER_TLS_KEY must be set together when TLS is enabled; omit both to generate a self-signed certificate")
 	}
 
-	timeoutSecs := 120
-	if val := strings.TrimSpace(os.Getenv("REQUEST_TIMEOUT")); val != "" {
-		if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
-			timeoutSecs = parsed
+	debug, err := parseBoolEnv("DEBUG", false)
+	if err != nil {
+		return nil, err
+	}
+
+	requestTimeout := 120 * time.Second
+	if value := strings.TrimSpace(os.Getenv("REQUEST_TIMEOUT")); value != "" {
+		seconds, err := strconv.Atoi(value)
+		if err != nil {
+			return nil, fmt.Errorf("REQUEST_TIMEOUT must be a positive integer number of seconds: %w", err)
 		}
+		if seconds <= 0 {
+			return nil, fmt.Errorf("REQUEST_TIMEOUT must be greater than zero")
+		}
+		requestTimeout = time.Duration(seconds) * time.Second
 	}
-
-	debugVal := strings.ToLower(strings.TrimSpace(os.Getenv("DEBUG")))
-	debug := debugVal == "true" || debugVal == "1" || debugVal == "yes"
 
 	return &Config{
 		Portal:           portal,
@@ -95,19 +104,23 @@ func Load() (*Config, error) {
 		ServerTLSEnabled: tlsEnabled,
 		ServerTLSCert:    serverTLSCert,
 		ServerTLSKey:     serverTLSKey,
-		RequestTimeout:   time.Duration(timeoutSecs) * time.Second,
+		RequestTimeout:   requestTimeout,
 		Debug:            debug,
 	}, nil
 }
 
 func parseBoolEnv(name string, defaultValue bool) (bool, error) {
-	value := strings.TrimSpace(os.Getenv(name))
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
 	if value == "" {
 		return defaultValue, nil
 	}
-	parsed, err := strconv.ParseBool(value)
-	if err != nil {
-		return false, fmt.Errorf("%s must be true or false", name)
+
+	switch value {
+	case "true", "1", "yes":
+		return true, nil
+	case "false", "0", "no":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s must be a boolean (true/false, yes/no, or 1/0)", name)
 	}
-	return parsed, nil
 }

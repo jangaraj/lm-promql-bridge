@@ -8,9 +8,11 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o /bin/lm-promql-bridge cmd/bridge/main.go
 
-FROM alpine:latest
+FROM scratch
 WORKDIR /root/
+
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /bin/lm-promql-bridge .
 
-EXPOSE 8080
+USER 65532:65532
 CMD ["./lm-promql-bridge"]

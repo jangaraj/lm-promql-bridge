@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"math/big"
 	"net"
-	"os"
 	"time"
 )
 
@@ -52,6 +51,7 @@ func selfSignedCertificate() (tls.Certificate, error) {
 	if err != nil {
 		return tls.Certificate{}, fmt.Errorf("generate certificate serial number: %w", err)
 	}
+
 	now := time.Now()
 	template := x509.Certificate{
 		SerialNumber:          serialNumber,
@@ -64,23 +64,24 @@ func selfSignedCertificate() (tls.Certificate, error) {
 		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
 		BasicConstraintsValid: true,
 	}
+
 	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
 	if err != nil {
 		return tls.Certificate{}, fmt.Errorf("create certificate: %w", err)
 	}
+
 	privateKeyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
 	if err != nil {
 		return tls.Certificate{}, fmt.Errorf("encode private key: %w", err)
 	}
+
 	certificatePEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	privateKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateKeyDER})
+
 	certificate, err := tls.X509KeyPair(certificatePEM, privateKeyPEM)
 	if err != nil {
 		return tls.Certificate{}, fmt.Errorf("parse generated certificate: %w", err)
 	}
+
 	return certificate, nil
 }
-
-// Keep os imported here so static analysis catches unusable configured paths
-// when this helper is extended to support additional certificate sources.
-var _ = os.ErrNotExist

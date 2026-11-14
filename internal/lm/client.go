@@ -24,8 +24,9 @@ import (
 )
 
 const (
-	maxQueryRangeChunks = 100
-	queryRangeWorkers   = 10
+	maxQueryRangeChunks            = 100
+	queryRangeWorkers              = 10
+	maxUpstreamResponseBytes int64 = 16 << 20 // 16 MiB
 )
 
 type Client struct {

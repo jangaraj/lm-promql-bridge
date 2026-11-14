@@ -2,6 +2,7 @@ package prom
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"log/slog"
 	"math"
@@ -19,6 +20,33 @@ type Handler struct {
 	lmClient    *lm.Client
 	debug       bool
 	concurrency chan struct{}
+}
+
+const maxRequestBodyBytes int64 = 1 << 20 // 1 MiB
+
+// LimitRequestBody bounds and buffers incoming request bodies before handlers parse them.
+func LimitRequestBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body == nil || r.Body == http.NoBody {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBodyBytes))
+		_ = r.Body.Close()
+		if err != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				writeError(w, "bad_data", "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			writeError(w, "bad_data", "could not read request body", http.StatusBadRequest)
+			return
+		}
+
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		next.ServeHTTP(w, r)
+	})
 }
 
 func NewHandler(lmClient *lm.Client, debug bool) *Handler {
