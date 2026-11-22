@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	json "github.com/json-iterator/go"
 
@@ -77,6 +78,52 @@ func writeError(w http.ResponseWriter, errorType, message string, statusCode int
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+func writeUpstreamError(w http.ResponseWriter, err error) {
+	if errors.Is(err, lm.ErrInvalidArgument) {
+		writeError(w, "bad_data", err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeError(w, "execution", err.Error(), http.StatusInternalServerError)
+}
+
+func parseTimestampParam(s string) (int64, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, false
+	}
+	if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return v, true
+	}
+	if f, err := strconv.ParseFloat(s, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+		if f >= float64(math.MinInt64) && f < -float64(math.MinInt64) {
+			return int64(f), true
+		}
+		return 0, false
+	}
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t.Unix(), true
+	}
+	return 0, false
+}
+
+func jsonValueToString(val interface{}) string {
+	switch v := val.(type) {
+	case string:
+		return v
+	case float64:
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return ""
+		}
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	case int:
+		return strconv.Itoa(v)
+	default:
+		return ""
+	}
+}
+
 func parseRequestParams(r *http.Request) (int64, int64, int, []string, string) {
 	var start, end int64
 	limit := 200
@@ -84,15 +131,11 @@ func parseRequestParams(r *http.Request) (int64, int64, int, []string, string) {
 	explicitMetric := ""
 
 	q := r.URL.Query()
-	if s := q.Get("start"); s != "" {
-		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
-			start = v
-		}
+	if v, ok := parseTimestampParam(q.Get("start")); ok {
+		start = v
 	}
-	if e := q.Get("end"); e != "" {
-		if v, err := strconv.ParseInt(e, 10, 64); err == nil {
-			end = v
-		}
+	if v, ok := parseTimestampParam(q.Get("end")); ok {
+		end = v
 	}
 	if l := q.Get("limit"); l != "" {
 		if v, err := strconv.Atoi(l); err == nil && v > 0 {
@@ -119,23 +162,13 @@ func parseRequestParams(r *http.Request) (int64, int64, int, []string, string) {
 				var jsonMap map[string]interface{}
 				if json.Unmarshal(bodyBytes, &jsonMap) == nil {
 					if val, ok := jsonMap["start"]; ok {
-						switch v := val.(type) {
-						case float64:
-							start = int64(v)
-						case string:
-							if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
-								start = parsed
-							}
+						if parsed, ok := parseTimestampParam(jsonValueToString(val)); ok {
+							start = parsed
 						}
 					}
 					if val, ok := jsonMap["end"]; ok {
-						switch v := val.(type) {
-						case float64:
-							end = int64(v)
-						case string:
-							if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
-								end = parsed
-							}
+						if parsed, ok := parseTimestampParam(jsonValueToString(val)); ok {
+							end = parsed
 						}
 					}
 					if val, ok := jsonMap["limit"]; ok {
@@ -173,15 +206,11 @@ func parseRequestParams(r *http.Request) (int64, int64, int, []string, string) {
 			}
 		} else {
 			_ = r.ParseForm()
-			if s := r.Form.Get("start"); s != "" {
-				if parsed, err := strconv.ParseInt(s, 10, 64); err == nil {
-					start = parsed
-				}
+			if parsed, ok := parseTimestampParam(r.Form.Get("start")); ok {
+				start = parsed
 			}
-			if e := r.Form.Get("end"); e != "" {
-				if parsed, err := strconv.ParseInt(e, 10, 64); err == nil {
-					end = parsed
-				}
+			if parsed, ok := parseTimestampParam(r.Form.Get("end")); ok {
+				end = parsed
 			}
 			if l := r.Form.Get("limit"); l != "" {
 				if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
@@ -289,7 +318,7 @@ func (h *Handler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 	rawResp, err := h.lmClient.Query(r.Context(), lmReq)
 	if err != nil {
 		slog.Error("failed to execute instant query against LM", "err", err)
-		writeError(w, "execution", err.Error(), http.StatusInternalServerError)
+		writeUpstreamError(w, err)
 		return
 	}
 
@@ -313,19 +342,21 @@ func (h *Handler) HandleQueryRange(w http.ResponseWriter, r *http.Request) {
 	var query, start, end, step string
 
 	if r.Method == http.MethodPost {
-		_ = r.ParseForm()
-		query = r.FormValue("query")
-		start = r.FormValue("start")
-		end = r.FormValue("end")
-		step = r.FormValue("step")
-		if query == "" {
-			var bodyMap map[string]string
+		mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if mediaType == "application/json" {
+			var bodyMap map[string]interface{}
 			if err := json.NewDecoder(r.Body).Decode(&bodyMap); err == nil {
-				query = bodyMap["query"]
-				start = bodyMap["start"]
-				end = bodyMap["end"]
-				step = bodyMap["step"]
+				query = jsonValueToString(bodyMap["query"])
+				start = jsonValueToString(bodyMap["start"])
+				end = jsonValueToString(bodyMap["end"])
+				step = jsonValueToString(bodyMap["step"])
 			}
+		} else {
+			_ = r.ParseForm()
+			query = r.FormValue("query")
+			start = r.FormValue("start")
+			end = r.FormValue("end")
+			step = r.FormValue("step")
 		}
 	} else {
 		query = r.URL.Query().Get("query")
@@ -349,7 +380,7 @@ func (h *Handler) HandleQueryRange(w http.ResponseWriter, r *http.Request) {
 	rawResp, err := h.lmClient.QueryRange(r.Context(), lmReq)
 	if err != nil {
 		slog.Error("failed to execute range query against LM", "err", err)
-		writeError(w, "execution", err.Error(), http.StatusInternalServerError)
+		writeUpstreamError(w, err)
 		return
 	}
 
@@ -381,7 +412,7 @@ func (h *Handler) HandleLabels(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		slog.Error("failed to fetch labels from LM", "err", err)
-		writeError(w, "execution", err.Error(), http.StatusInternalServerError)
+		writeUpstreamError(w, err)
 		return
 	}
 
@@ -423,7 +454,7 @@ func (h *Handler) HandleLabelValuesOrSeries(w http.ResponseWriter, r *http.Reque
 			})
 			if err != nil {
 				slog.Error("failed to fetch metric names from LM for __name__", "err", err)
-				writeError(w, "execution", err.Error(), http.StatusInternalServerError)
+				writeUpstreamError(w, err)
 				return
 			}
 
@@ -453,7 +484,7 @@ func (h *Handler) HandleLabelValuesOrSeries(w http.ResponseWriter, r *http.Reque
 		})
 		if err != nil {
 			slog.Error("failed to fetch label values from LM", "label", labelName, "err", err)
-			writeError(w, "execution", err.Error(), http.StatusInternalServerError)
+			writeUpstreamError(w, err)
 			return
 		}
 
@@ -492,11 +523,11 @@ func (h *Handler) HandleSeries(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		slog.Error("failed to fetch metric names from LM", "err", err)
-		writeError(w, "execution", err.Error(), http.StatusInternalServerError)
+		writeUpstreamError(w, err)
 		return
 	}
 
-	translated, err := TranslateMetadataResponse(rawResp, h.debug, r.URL.Path)
+	out, err := translateSeriesResponse(rawResp)
 	if err != nil {
 		writeError(w, "internal", err.Error(), http.StatusInternalServerError)
 		return
@@ -504,7 +535,26 @@ func (h *Handler) HandleSeries(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(translated)
+	_, _ = w.Write(out)
+}
+
+func translateSeriesResponse(rawResp []byte) ([]byte, error) {
+	var lmResp struct {
+		Data []string `json:"data"`
+	}
+	if err := json.Unmarshal(rawResp, &lmResp); err != nil {
+		return nil, errors.New("failed to decode LogicMonitor series response")
+	}
+
+	series := make([]map[string]string, 0, len(lmResp.Data))
+	for _, metricName := range lmResp.Data {
+		series = append(series, map[string]string{"__name__": metricName})
+	}
+
+	return json.Marshal(PromMetaResponse{
+		Status: "success",
+		Data:   series,
+	})
 }
 
 type MetricMetadata struct {
@@ -521,11 +571,11 @@ func parseInstantQueryRequest(r *http.Request) (query, timeStr string) {
 	mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if mediaType == "application/json" {
 		var body struct {
-			Query string `json:"query"`
-			Time  string `json:"time"`
+			Query string      `json:"query"`
+			Time  interface{} `json:"time"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
-			return body.Query, body.Time
+			return body.Query, jsonValueToString(body.Time)
 		}
 		return "", ""
 	}
@@ -557,7 +607,7 @@ func (h *Handler) HandleMetadata(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		slog.Error("failed to fetch metric names for metadata from LM", "err", err)
-		writeError(w, "execution", err.Error(), http.StatusInternalServerError)
+		writeUpstreamError(w, err)
 		return
 	}
 
@@ -597,20 +647,3 @@ func (h *Handler) HandleMetadata(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(out)
 }
-
-// // BasicAuthMiddleware enforces HTTP Basic Authentication if credentials are provided.
-// func BasicAuthMiddleware(username, password string, next http.Handler) http.Handler {
-// 	if username == "" && password == "" {
-// 		return next
-// 	}
-
-// 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-// 		user, pass, ok := r.BasicAuth()
-// 		if !ok || user != username || pass != password {
-// 			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
-// 			writeError(w, "unauthorized", "invalid username or password", http.StatusUnauthorized)
-// 			return
-// 		}
-// 		next.ServeHTTP(w, r)
-// 	})
-// }

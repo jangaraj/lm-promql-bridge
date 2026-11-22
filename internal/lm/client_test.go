@@ -1,12 +1,15 @@
 package lm
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -178,5 +181,110 @@ func TestRateLimitRetryDelay(t *testing.T) {
 				t.Fatalf("delay = %s, want %s", delay, tt.wantDelay)
 			}
 		})
+	}
+}
+
+type staticRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f staticRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestDoRequestWithContext_RejectsOversizedResponse(t *testing.T) {
+	oversized := bytes.Repeat([]byte("a"), int(maxUpstreamResponseBytes)+1)
+	client := &Client{
+		cfg: &config.Config{
+			Portal:      "example.com",
+			BearerToken: "test-token",
+		},
+		httpClient: &http.Client{
+			Transport: staticRoundTripper(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(bytes.NewReader(oversized)),
+					Header:     make(http.Header),
+					Request:    req,
+				}, nil
+			}),
+		},
+	}
+
+	_, err := client.doRequestWithContext(context.Background(), "/metrics/query", &QueryRequest{Query: "up"})
+	if err == nil {
+		t.Fatal("expected error for oversized upstream response")
+	}
+	if !strings.Contains(err.Error(), "exceeded maximum size") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestMetricKey_CollisionResistant(t *testing.T) {
+	k1 := metricKey(map[string]string{"a": "b,c=d"})
+	k2 := metricKey(map[string]string{"a": "b", "c": "d"})
+	if k1 == k2 {
+		t.Fatalf("metricKey collided: %q == %q", k1, k2)
+	}
+}
+
+func TestQueryRange_InvalidRangeReturnsErrInvalidArgument(t *testing.T) {
+	client := &Client{
+		cfg: &config.Config{
+			Portal:      "example.com",
+			BearerToken: "test-token",
+		},
+		httpClient: &http.Client{},
+	}
+
+	_, err := client.QueryRange(context.Background(), &QueryRequest{
+		Query: "up",
+		Start: "200",
+		End:   "100",
+		Step:  "60",
+	})
+	if !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("expected ErrInvalidArgument, got %v", err)
+	}
+}
+
+func TestQueryRange_MergesAndDeduplicatesChunks(t *testing.T) {
+	var call atomic.Int32
+	client := &Client{
+		cfg: &config.Config{
+			Portal:      "example.com",
+			BearerToken: "test-token",
+		},
+		httpClient: &http.Client{
+			Transport: staticRoundTripper(func(req *http.Request) (*http.Response, error) {
+				n := call.Add(1)
+				body := `{"data":[{"metric":{"__name__":"up","host":"a"},"values":[{"timestamp":100,"value":"1"},{"timestamp":200,"value":"2"}]}]}`
+				if n == 2 {
+					body = `{"data":[{"metric":{"__name__":"up","host":"a"},"values":[{"timestamp":200,"value":"2"},{"timestamp":300,"value":"3"}]}]}`
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(body)),
+					Header:     make(http.Header),
+					Request:    req,
+				}, nil
+			}),
+		},
+	}
+
+	end := strconv.FormatInt(26*24*3600, 10)
+	resp, err := client.QueryRange(context.Background(), &QueryRequest{
+		Query: "up",
+		Start: "0",
+		End:   end,
+		Step:  "60",
+	})
+	if err != nil {
+		t.Fatalf("QueryRange() error = %v", err)
+	}
+	got := string(resp)
+	if strings.Count(got, `"timestamp":200`) != 1 {
+		t.Fatalf("expected deduplicated timestamp 200, got %s", got)
+	}
+	if !strings.Contains(got, `"timestamp":100`) || !strings.Contains(got, `"timestamp":300`) {
+		t.Fatalf("expected timestamps 100 and 300 in merged response, got %s", got)
 	}
 }

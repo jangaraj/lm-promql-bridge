@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,8 +20,6 @@ import (
 	"time"
 
 	"lm-promql-bridge/internal/config"
-
-	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -28,6 +27,9 @@ const (
 	queryRangeWorkers              = 10
 	maxUpstreamResponseBytes int64 = 16 << 20 // 16 MiB
 )
+
+// ErrInvalidArgument indicates an invalid caller-supplied query or range parameter.
+var ErrInvalidArgument = errors.New("invalid argument")
 
 type Client struct {
 	cfg        *config.Config
@@ -215,9 +217,12 @@ func (c *Client) doRequestWithContext(ctx context.Context, path string, payload 
 		}
 	}()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamResponseBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+	if int64(len(respBody)) > maxUpstreamResponseBytes {
+		return nil, fmt.Errorf("logicmonitor API response exceeded maximum size of %d bytes", maxUpstreamResponseBytes)
 	}
 
 	if c.cfg.Debug {
@@ -252,17 +257,17 @@ func (c *Client) QueryRange(ctx context.Context, req *QueryRequest) ([]byte, err
 
 	if math.IsNaN(startVal) || math.IsInf(startVal, 0) ||
 		math.IsNaN(endVal) || math.IsInf(endVal, 0) {
-		return nil, fmt.Errorf("query range start and end must be finite values")
+		return nil, fmt.Errorf("%w: query range start and end must be finite values", ErrInvalidArgument)
 	}
 	if endVal < startVal {
-		return nil, fmt.Errorf("query range end must not be before start")
+		return nil, fmt.Errorf("%w: query range end must not be before start", ErrInvalidArgument)
 	}
 
 	maxChunkDuration := float64(25 * 24 * 3600)
 	duration := endVal - startVal
 	maxRangeDuration := maxChunkDuration * maxQueryRangeChunks
 	if duration > maxRangeDuration {
-		return nil, fmt.Errorf("query range exceeds maximum of %d chunks", maxQueryRangeChunks)
+		return nil, fmt.Errorf("%w: query range exceeds maximum of %d chunks", ErrInvalidArgument, maxQueryRangeChunks)
 	}
 
 	chunkCount := int(math.Ceil(duration / maxChunkDuration))
@@ -291,72 +296,47 @@ func (c *Client) QueryRange(ctx context.Context, req *QueryRequest) ([]byte, err
 		currentStart = currentEnd
 	}
 
-	results := make([][]lmMetricResult, len(chunks))
-	jobs := make(chan int)
-	g, gCtx := errgroup.WithContext(ctx)
-
-	workerCount := min(queryRangeWorkers, len(chunks))
-	for range workerCount {
-		g.Go(func() error {
-			for i := range jobs {
-				chunk := chunks[i]
-				subReq := &QueryRequest{
-					Query: req.Query,
-					Time:  req.Time,
-					Start: strconv.FormatFloat(chunk.start, 'f', -1, 64),
-					End:   strconv.FormatFloat(chunk.end, 'f', -1, 64),
-					Step:  req.Step,
-				}
-
-				respBytes, err := c.doRequestWithContext(gCtx, "/metrics/query-range", subReq)
-				if err != nil {
-					return fmt.Errorf("query-range chunk %d: %w", i+1, err)
-				}
-
-				var lmResp lmAPIResponse
-				if err := json.Unmarshal(respBytes, &lmResp); err != nil {
-					return fmt.Errorf("decode LogicMonitor query-range response for chunk %d: %w", i+1, err)
-				}
-
-				data := bytes.TrimSpace(lmResp.Data)
-				if len(data) == 0 || bytes.Equal(data, []byte("null")) {
-					// LogicMonitor may return no data for a chunk in a long range query.
-					// Treat that chunk as empty and merge results from the remaining chunks.
-					results[i] = []lmMetricResult{}
-					continue
-				}
-				if data[0] != '[' {
-					return fmt.Errorf("LogicMonitor query-range response for chunk %d has invalid data: expected an array", i+1)
-				}
-
-				var chunkMetrics []lmMetricResult
-				if err := json.Unmarshal(data, &chunkMetrics); err != nil {
-					return fmt.Errorf("decode LogicMonitor query-range data for chunk %d: %w", i+1, err)
-				}
-				if chunkMetrics == nil {
-					return fmt.Errorf("LogicMonitor query-range response for chunk %d has null data; expected an array", i+1)
-				}
-
-				results[i] = chunkMetrics
-			}
-			return nil
-		})
-	}
-
-dispatch:
-	for i := range chunks {
-		select {
-		case jobs <- i:
-		case <-gCtx.Done():
-			break dispatch
+	results, err := runChunked(ctx, len(chunks), func(gCtx context.Context, i int) ([]lmMetricResult, error) {
+		chunk := chunks[i]
+		subReq := &QueryRequest{
+			Query: req.Query,
+			Time:  req.Time,
+			Start: strconv.FormatFloat(chunk.start, 'f', -1, 64),
+			End:   strconv.FormatFloat(chunk.end, 'f', -1, 64),
+			Step:  req.Step,
 		}
-	}
-	close(jobs)
 
-	if err := g.Wait(); err != nil {
-		return nil, err
-	}
-	if err := ctx.Err(); err != nil {
+		respBytes, err := c.doRequestWithContext(gCtx, "/metrics/query-range", subReq)
+		if err != nil {
+			return nil, fmt.Errorf("query-range chunk %d: %w", i+1, err)
+		}
+
+		var lmResp lmAPIResponse
+		if err := json.Unmarshal(respBytes, &lmResp); err != nil {
+			return nil, fmt.Errorf("decode LogicMonitor query-range response for chunk %d: %w", i+1, err)
+		}
+
+		data := bytes.TrimSpace(lmResp.Data)
+		if len(data) == 0 || bytes.Equal(data, []byte("null")) {
+			// LogicMonitor may return no data for a chunk in a long range query.
+			// Treat that chunk as empty and merge results from the remaining chunks.
+			return []lmMetricResult{}, nil
+		}
+		if data[0] != '[' {
+			return nil, fmt.Errorf("LogicMonitor query-range response for chunk %d has invalid data: expected an array", i+1)
+		}
+
+		var chunkMetrics []lmMetricResult
+		if err := json.Unmarshal(data, &chunkMetrics); err != nil {
+			return nil, fmt.Errorf("decode LogicMonitor query-range data for chunk %d: %w", i+1, err)
+		}
+		if chunkMetrics == nil {
+			return nil, fmt.Errorf("LogicMonitor query-range response for chunk %d has null data; expected an array", i+1)
+		}
+
+		return chunkMetrics, nil
+	})
+	if err != nil {
 		return nil, err
 	}
 
@@ -405,10 +385,15 @@ func metricKey(labels map[string]string) string {
 	sort.Strings(keys)
 	var sb strings.Builder
 	for _, k := range keys {
+		v := labels[k]
+		sb.WriteString(strconv.Itoa(len(k)))
+		sb.WriteByte(':')
 		sb.WriteString(k)
-		sb.WriteString("=")
-		sb.WriteString(labels[k])
-		sb.WriteString(",")
+		sb.WriteByte('=')
+		sb.WriteString(strconv.Itoa(len(v)))
+		sb.WriteByte(':')
+		sb.WriteString(v)
+		sb.WriteByte(';')
 	}
 	return sb.String()
 }

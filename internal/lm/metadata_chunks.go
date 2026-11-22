@@ -35,7 +35,8 @@ func (c *Client) queryTimeChunkedStrings(
 	maxDuration := uint64(metadataChunkDuration) * uint64(maxQueryRangeChunks)
 	if duration > maxDuration {
 		return nil, true, fmt.Errorf(
-			"metadata time range exceeds maximum of %d chunks",
+			"%w: metadata time range exceeds maximum of %d chunks",
+			ErrInvalidArgument,
 			maxQueryRangeChunks,
 		)
 	}
@@ -57,62 +58,38 @@ func (c *Client) queryTimeChunkedStrings(
 		chunkStart = chunkEnd
 	}
 
-	results := make([][]string, len(chunks))
-	jobs := make(chan int)
-	group, groupCtx := errgroup.WithContext(ctx)
-
-	workerCount := min(queryRangeWorkers, len(chunks))
-	for range workerCount {
-		group.Go(func() error {
-			for i := range jobs {
-				chunk := chunks[i]
-				body, err := c.doRequestWithContext(
-					groupCtx,
-					path,
-					makeRequest(chunk.start, chunk.end),
-				)
-				if err != nil {
-					return fmt.Errorf("metadata chunk %d: %w", i+1, err)
-				}
-
-				var response lmAPIResponse
-				if err := json.Unmarshal(body, &response); err != nil {
-					return fmt.Errorf("decode metadata response for chunk %d: %w", i+1, err)
-				}
-
-				data := bytes.TrimSpace(response.Data)
-				if len(data) == 0 || bytes.Equal(data, []byte("null")) {
-					// An empty chunk is valid; merge results from the other chunks.
-					continue
-				}
-				if data[0] != '[' {
-					return fmt.Errorf("metadata response for chunk %d has invalid data: expected an array", i+1)
-				}
-
-				var values []string
-				if err := json.Unmarshal(data, &values); err != nil {
-					return fmt.Errorf("decode metadata data for chunk %d: %w", i+1, err)
-				}
-				results[i] = values
-			}
-			return nil
-		})
-	}
-
-dispatch:
-	for i := range chunks {
-		select {
-		case jobs <- i:
-		case <-groupCtx.Done():
-			break dispatch
+	results, err := runChunked(ctx, len(chunks), func(groupCtx context.Context, i int) ([]string, error) {
+		chunk := chunks[i]
+		body, err := c.doRequestWithContext(
+			groupCtx,
+			path,
+			makeRequest(chunk.start, chunk.end),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("metadata chunk %d: %w", i+1, err)
 		}
-	}
-	close(jobs)
 
-	if err := group.Wait(); err != nil {
-		return nil, true, err
-	}
-	if err := ctx.Err(); err != nil {
+		var response lmAPIResponse
+		if err := json.Unmarshal(body, &response); err != nil {
+			return nil, fmt.Errorf("decode metadata response for chunk %d: %w", i+1, err)
+		}
+
+		data := bytes.TrimSpace(response.Data)
+		if len(data) == 0 || bytes.Equal(data, []byte("null")) {
+			// An empty chunk is valid; merge results from the other chunks.
+			return nil, nil
+		}
+		if data[0] != '[' {
+			return nil, fmt.Errorf("metadata response for chunk %d has invalid data: expected an array", i+1)
+		}
+
+		var values []string
+		if err := json.Unmarshal(data, &values); err != nil {
+			return nil, fmt.Errorf("decode metadata data for chunk %d: %w", i+1, err)
+		}
+		return values, nil
+	})
+	if err != nil {
 		return nil, true, err
 	}
 
@@ -144,4 +121,44 @@ dispatch:
 	}
 
 	return result, true, nil
+}
+
+// runChunked executes fn across chunkCount items using a bounded worker pool.
+func runChunked[T any](ctx context.Context, chunkCount int, fn func(context.Context, int) (T, error)) ([]T, error) {
+	results := make([]T, chunkCount)
+	jobs := make(chan int)
+	group, groupCtx := errgroup.WithContext(ctx)
+
+	workerCount := min(queryRangeWorkers, chunkCount)
+	for range workerCount {
+		group.Go(func() error {
+			for i := range jobs {
+				res, err := fn(groupCtx, i)
+				if err != nil {
+					return err
+				}
+				results[i] = res
+			}
+			return nil
+		})
+	}
+
+dispatch:
+	for i := range chunkCount {
+		select {
+		case jobs <- i:
+		case <-groupCtx.Done():
+			break dispatch
+		}
+	}
+	close(jobs)
+
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	return results, nil
 }
