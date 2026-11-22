@@ -35,9 +35,12 @@ jobs:
 
           GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="${LDFLAGS}" -o dist/lm-promql-bridge-${VERSION}-linux-amd64 ./cmd/bridge
           GOOS=linux   GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="${LDFLAGS}" -o dist/lm-promql-bridge-${VERSION}-linux-arm64 ./cmd/bridge
+          GOOS=linux   GOARCH=arm   CGO_ENABLED=0 go build -ldflags="${LDFLAGS}" -o dist/lm-promql-bridge-${VERSION}-linux-arm ./cmd/bridge
+          GOOS=linux   GOARCH=s390x CGO_ENABLED=0 go build -ldflags="${LDFLAGS}" -o dist/lm-promql-bridge-${VERSION}-linux-s390x ./cmd/bridge
           GOOS=darwin  GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="${LDFLAGS}" -o dist/lm-promql-bridge-${VERSION}-darwin-amd64 ./cmd/bridge
           GOOS=darwin  GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="${LDFLAGS}" -o dist/lm-promql-bridge-${VERSION}-darwin-arm64 ./cmd/bridge
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="${LDFLAGS}" -o dist/lm-promql-bridge-${VERSION}-windows-amd64.exe ./cmd/bridge
+          GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="${LDFLAGS}" -o dist/lm-promql-bridge-${VERSION}-windows-arm64.exe ./cmd/bridge
 
           cd dist
           sha256sum * > checksums.txt
